@@ -1,6 +1,44 @@
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple, Type
+from typing_extensions import Literal
+
+
+
 import torch 
 import torch.nn as nn
 from nerfstudio.models.base_model import ModelConfig, Model
+
+
+import torch
+import nerfacc
+import trimesh
+import numpy as np
+from tqdm import tqdm
+from torch.nn import Parameter
+from rich.console import Console
+from torchmetrics.image import PeakSignalNoiseRatio
+from torchmetrics.functional.image.ssim import structural_similarity_index_measure
+from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
+
+from nerfstudio.cameras.rays import RayBundle
+from nerfstudio.configs.config_utils import to_immutable_dict
+from nerfstudio.engine.callbacks import (
+    TrainingCallback,
+    TrainingCallbackAttributes,
+    TrainingCallbackLocation,
+)
+from nerfstudio.field_components.field_heads import FieldHeadNames
+from nerfstudio.model_components.scene_colliders import NearFarCollider
+from nerfstudio.models.base_model import Model, ModelConfig
+from nerfstudio.utils import colormaps, misc
+
+from .utils import FocalLoss, AverageMeter
+from .field import LightningField
+from .sampler import LightningNeRFSampler
+
+
+
 
 @dataclass 
 class EnhancedNeRFModelConfig:
@@ -115,6 +153,56 @@ class EnhancedNeRFModel(Model):
             )
 
             if not self.training:
+                 colors = torch.nan_to_num(colors)
+        comp_rgb = nerfacc.accumulate_along_rays(
+            weights, values=colors, ray_indices=ray_indices, n_rays=num_rays
+        )
+        accumulation = nerfacc.accumulate_along_rays(
+            weights, values=None, ray_indices=ray_indices, n_rays=num_rays
+        )
+        bg_color = torch.rand_like(comp_rgb) if self.bg_color is None else self.bg_color
+        rgb = comp_rgb + bg_color * (1.0 - accumulation)
+        if not self.training:
+            torch.clamp_(rgb, min=0.0, max=1.0)
+        
+        steps = (ray_samples.frustums.starts + ray_samples.frustums.ends) / 2
+        depth = nerfacc.accumulate_along_rays(
+            weights, values=steps, ray_indices=ray_indices, n_rays=num_rays
+        )
+        depth = depth / (accumulation + 1e-10)
+        depth = torch.clip(depth, steps.min(), steps.max())
+        
+        outputs = {
+            "rgb": rgb,
+            "accumulation": accumulation,
+            "depth": depth,
+            "num_samples_per_ray": packed_info[:, 1],
+        }
+        
+        if self.training:
+            res_rgb = field_outputs.get("res_rgb", None)
+            if res_rgb is not None:
+                res_rgb_loss = torch.mean(res_rgb)  # for rgb combined before sigmoid
+                outputs.update({"res_rgb_loss": res_rgb_loss})
+
+        return outputs
+
+    def get_metrics_dict(self, outputs, batch):
+        image = batch["image"].to(self.device)
+        metrics_dict = {}
+        metrics_dict["psnr"] = self.psnr(outputs["rgb"], image)
+        metrics_dict["num_samples_per_batch"] = outputs["num_samples_per_ray"].sum()
+        
+        return metrics_dict
+
+    def get_loss_dict(self, outputs, batch, metrics_dict=None):
+        image = batch["image"].to(self.device)
+        loss_dict = {"rgb_loss": self.rgb_loss(image, outputs["rgb"])}
+        # regularizer for view-dependent color
+        if outputs.get("res_rgb_loss") is not None:
+            loss_dict.update({"res_rgb_loss": outputs["res_rgb_loss"]})
+        
+        loss_dict = misc.scale_dict(loss_dict, se
                 
 
 
